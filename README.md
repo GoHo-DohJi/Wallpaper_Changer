@@ -27,6 +27,10 @@ cl /nologo ^
 -----------------------------------------------------
 !!! ADD TO REALSES EXE PROGRAM
 
+
+Добавляем в реестр wallpaper tile; fit и jpegquality
+
+
 PATH PROJECT 
 %LOCALAPPDATA%\Programs\WallpaperChanger\WallpaperChanger.exe
 
@@ -63,3 +67,4 @@ Copy-Item `
 # Cleanup
 Remove-Item $tempZip -Force
 Remove-Item $tempDir -Recurse -Force
+
