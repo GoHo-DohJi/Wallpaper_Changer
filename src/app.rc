@@ -1,0 +1,35 @@
+#include <winver.h>
+
+#define VER_FILEVERSION 1,0,0,0
+#define VER_PRODUCTVERSION 1,0,0,0
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION VER_FILEVERSION
+ PRODUCTVERSION VER_PRODUCTVERSION
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+{
+ BLOCK "StringFileInfo"
+ {
+  BLOCK "040904B0"
+  {
+   VALUE "CompanyName", "3DZHio"
+   VALUE "FileDescription", "Wallpaper Changer"
+   VALUE "FileVersion", "1.0.0"
+   VALUE "ProductName", "WallpaperChanger"
+   VALUE "ProductVersion", "1.0.0"
+   VALUE "InternalName", "WallpaperChanger"
+   VALUE "OriginalFilename", "WallpaperChanger.exe"
+  }
+ }
+
+ BLOCK "VarFileInfo"
+ {
+  VALUE "Translation", 0x0409, 1200
+ }
+}
+
+/* MANIFEST */
+1 RT_MANIFEST "app.manifest"
