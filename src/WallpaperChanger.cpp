@@ -199,24 +199,30 @@ UINT GetCurrentMonitorCount() {
 }
 
 // ============================================================================
-// Image Queue Manager
-// Guarantees: Every image is used exactly once per complete cycle.
-// Queue is reshuffled only after ALL images have been consumed.
+// Image Queue Manager (Simplified)
+// ============================================================================
+// Simple sequential consumption:
+// - Take from queue until empty
+// - When empty, create new shuffled queue
+// - Continue taking
 // ============================================================================
 
 class ImageQueueManager {
 private:
-    std::vector<std::wstring> m_allImages;      // All available images (master list)
-    std::deque<std::wstring> m_queue;           // Current shuffled queue to consume
-    std::set<std::wstring> m_usedThisCycle;     // Track images used in current cycle
+    std::deque<std::wstring> m_queue;           // Current shuffled queue
     std::wstring m_folderPath;
     std::mt19937 m_rng;
 
-    // Verify file exists and is accessible
     bool FileExists(const std::wstring& path) const {
         DWORD attribs = GetFileAttributesW(path.c_str());
         return (attribs != INVALID_FILE_ATTRIBUTES) && 
                !(attribs & FILE_ATTRIBUTE_DIRECTORY);
+    }
+
+    void RefillQueue() {
+        std::vector<std::wstring> images = ScanImagesInFolder(m_folderPath);
+        m_queue.assign(images.begin(), images.end());
+        std::shuffle(m_queue.begin(), m_queue.end(), m_rng);
     }
 
 public:
@@ -226,89 +232,33 @@ public:
         m_folderPath = path;
     }
 
-    // Rescan folder and create new shuffled queue
-    void RescanAndReshuffleQueue() {
-        m_allImages = ScanImagesInFolder(m_folderPath);
-        m_queue.assign(m_allImages.begin(), m_allImages.end());
-        std::shuffle(m_queue.begin(), m_queue.end(), m_rng);
-        m_usedThisCycle.clear();
-    }
-
-    // Get images for current update cycle
-    // Guarantees no image repeats within a complete queue cycle
     std::vector<std::wstring> GetImagesForUpdate(UINT monitorCount) {
         std::vector<std::wstring> result;
-        std::set<std::wstring> usedThisUpdate;
 
-        // If queue is empty, start new cycle
-        if (m_queue.empty()) {
-            RescanAndReshuffleQueue();
-        }
-
-        // If still empty (no images), return empty result
-        if (m_queue.empty()) {
-            return result;
-        }
-
-        // Step 1: Take images from queue (guaranteed unique within cycle)
-        while (!m_queue.empty() && result.size() < monitorCount) {
+        while (result.size() < monitorCount) {
+            // Queue empty? Refill it
+            if (m_queue.empty()) {
+                RefillQueue();
+                
+                // No images at all - exit
+                if (m_queue.empty()) {
+                    break;
+                }
+            }
+            
+            // Take next from queue
             std::wstring img = m_queue.front();
             m_queue.pop_front();
-
-            // Verify file still exists
+            
+            // Use only if file still exists
             if (FileExists(img)) {
                 result.push_back(img);
-                usedThisUpdate.insert(img);
-                m_usedThisCycle.insert(img);
-            }
-        }
-
-        // Step 2: If queue exhausted but need more monitors filled
-        // Fill remaining slots, avoiding duplicates within this update
-        if (result.size() < monitorCount && !m_allImages.empty()) {
-            // Build candidates: images not used in this update, preferring unused in cycle
-            std::vector<std::wstring> candidates;
-            
-            for (const auto& img : m_allImages) {
-                if (usedThisUpdate.find(img) == usedThisUpdate.end() && FileExists(img)) {
-                    candidates.push_back(img);
-                }
-            }
-
-            std::shuffle(candidates.begin(), candidates.end(), m_rng);
-
-            for (const auto& img : candidates) {
-                if (result.size() >= monitorCount) break;
-                result.push_back(img);
-                usedThisUpdate.insert(img);
-            }
-        }
-
-        // Step 3: If still not enough (more monitors than unique images)
-        // Allow duplicates as last resort
-        if (result.size() < monitorCount && !m_allImages.empty()) {
-            std::vector<std::wstring> validImages;
-            for (const auto& img : m_allImages) {
-                if (FileExists(img)) {
-                    validImages.push_back(img);
-                }
-            }
-            
-            if (!validImages.empty()) {
-                std::shuffle(validImages.begin(), validImages.end(), m_rng);
-                size_t idx = 0;
-                while (result.size() < monitorCount) {
-                    result.push_back(validImages[idx % validImages.size()]);
-                    idx++;
-                }
             }
         }
 
         return result;
     }
 
-    bool HasImages() const { return !m_allImages.empty(); }
-    size_t GetTotalImageCount() const { return m_allImages.size(); }
     size_t GetQueueRemainingCount() const { return m_queue.size(); }
 };
 
@@ -451,4 +401,5 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     // Cleanup (never reached in normal operation)
     CloseHandle(hMutex);
     return 0;
+
 }
