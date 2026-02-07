@@ -17,7 +17,6 @@ cl /nologo ^
    /link ^
    /LTCG ^
    /INCREMENTAL:NO ^
-   /SUBSYSTEM:WINDOWS ^
    /OPT:REF /OPT:ICF
 
 
@@ -67,4 +66,5 @@ Copy-Item `
 # Cleanup
 Remove-Item $tempZip -Force
 Remove-Item $tempDir -Recurse -Force
+
 
