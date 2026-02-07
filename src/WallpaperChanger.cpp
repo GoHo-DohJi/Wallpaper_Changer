@@ -11,36 +11,75 @@
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "User32.lib")
 
+// Linker
+#pragma comment(linker, "/SUBSYSTEM:WINDOWS")
+
 #include <windows.h>
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <string>
 #include <vector>
 #include <deque>
-#include <set>
 #include <algorithm>
 #include <random>
+
+// ============================================================================
+// RAII COM Pointer (no WRL dependency)
+// ============================================================================
+
+template <typename T>
+class ScopedComPtr {
+    T* m_ptr = nullptr;
+public:
+    ScopedComPtr() = default;
+    ~ScopedComPtr() { Reset(); }
+    ScopedComPtr(const ScopedComPtr&) = delete;
+    ScopedComPtr& operator=(const ScopedComPtr&) = delete;
+
+    void Reset() {
+        if (m_ptr) {
+            m_ptr->Release();
+            m_ptr = nullptr;
+        }
+    }
+
+    T*  Get()          const { return m_ptr; }
+    T*  operator->()   const { return m_ptr; }
+    T** GetAddressOf()       { Reset(); return &m_ptr; }
+    explicit operator bool() const { return m_ptr != nullptr; }
+};
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-static const wchar_t* MUTEX_NAME = L"Global\\WallpaperChangerSingleInstanceMutex_v1";
-static const wchar_t* REG_KEY_PATH = L"Software\\WallpaperChanger";
-static const wchar_t* REG_VALUE_INTERVAL = L"IntervalSeconds";
-static const DWORD DEFAULT_INTERVAL_SECONDS = 300; // 5 minutes
-static const wchar_t* EVENT_LOG_SOURCE = L"WallpaperChanger";
+static const wchar_t* MUTEX_NAME            = L"Global\\WallpaperChangerSingleInstanceMutex_v1";
+static const wchar_t* REG_KEY_PATH          = L"Software\\WallpaperChanger";
+static const wchar_t* REG_VALUE_INTERVAL    = L"IntervalSeconds";
+static const DWORD    DEFAULT_INTERVAL_SEC  = 300;        // 5 minutes
+static const DWORD    MAX_INTERVAL_SEC      = 86400;      // 24 hours
+static const wchar_t* EVENT_LOG_SOURCE      = L"WallpaperChanger";
+static const wchar_t* WND_CLASS_NAME        = L"WallpaperChangerHiddenWnd";
 
-// Supported wallpaper file extensions (Windows supported formats)
 static const wchar_t* SUPPORTED_EXTENSIONS[] = {
     L".jpg", L".jpeg", L".jpe", L".jfif",
-    L".png", L".bmp", L".dib",
-    L".gif", L".tif", L".tiff", L".wdp"
+    L".png", L".bmp",  L".dib",
+    L".gif", L".tif",  L".tiff", L".wdp",
+    L".heic", L".heif",
+    L".webp",
+    L".avif"
 };
-static const size_t NUM_SUPPORTED_EXTENSIONS = sizeof(SUPPORTED_EXTENSIONS) / sizeof(SUPPORTED_EXTENSIONS[0]);
+static const size_t NUM_EXTENSIONS =
+    sizeof(SUPPORTED_EXTENSIONS) / sizeof(SUPPORTED_EXTENSIONS[0]);
 
 // ============================================================================
-// Error State Management (State-Based Logging)
+// Global state
+// ============================================================================
+
+static HANDLE g_hStopEvent = NULL;          // signalled → graceful exit
+
+// ============================================================================
+// Error-State Logging (logs only on state transition)
 // ============================================================================
 
 enum class ErrorState {
@@ -51,64 +90,45 @@ enum class ErrorState {
     ComInitFailed
 };
 
-static ErrorState g_currentErrorState = ErrorState::None;
+static ErrorState g_errorState = ErrorState::None;
 
-// Log error message to Windows Event Log
-void LogEventError(const wchar_t* message) {
-    HANDLE hEventLog = RegisterEventSourceW(NULL, EVENT_LOG_SOURCE);
-    if (hEventLog != NULL) {
-        const wchar_t* messages[] = { message };
-        ReportEventW(hEventLog, EVENTLOG_ERROR_TYPE, 0, 1000, NULL, 1, 0, messages, NULL);
-        DeregisterEventSource(hEventLog);
+static void LogEventError(const wchar_t* message) {
+    HANDLE hLog = RegisterEventSourceW(NULL, EVENT_LOG_SOURCE);
+    if (hLog) {
+        const wchar_t* msgs[] = { message };
+        ReportEventW(hLog, EVENTLOG_ERROR_TYPE, 0, 1000, NULL, 1, 0, msgs, NULL);
+        DeregisterEventSource(hLog);
     }
 }
 
-// Transition error state - logs only on state change (Normal -> Error)
-void TransitionErrorState(ErrorState newState, const wchar_t* message) {
-    if (newState != g_currentErrorState) {
-        if (newState != ErrorState::None && message != nullptr) {
-            LogEventError(message);
-        }
-        g_currentErrorState = newState;
+static void TransitionError(ErrorState s, const wchar_t* msg) {
+    if (s != g_errorState) {
+        if (s != ErrorState::None && msg)
+            LogEventError(msg);
+        g_errorState = s;
     }
 }
 
 // ============================================================================
-// Registry Operations
+// Registry: read (or create default) interval
 // ============================================================================
 
-DWORD ReadOrCreateRegistryInterval() {
-    HKEY hKey = NULL;
-    DWORD interval = DEFAULT_INTERVAL_SECONDS;
+static DWORD ReadOrCreateInterval() {
+    HKEY  hKey     = NULL;
+    DWORD interval = DEFAULT_INTERVAL_SEC;
 
-    LONG result = RegCreateKeyExW(
-        HKEY_CURRENT_USER,
-        REG_KEY_PATH,
-        0,
-        NULL,
-        REG_OPTION_NON_VOLATILE,
-        KEY_READ | KEY_WRITE,
-        NULL,
-        &hKey,
-        NULL
-    );
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY_PATH, 0, NULL,
+            REG_OPTION_NON_VOLATILE, KEY_READ | KEY_WRITE,
+            NULL, &hKey, NULL) != ERROR_SUCCESS)
+        return DEFAULT_INTERVAL_SEC;
 
-    if (result != ERROR_SUCCESS) {
-        return DEFAULT_INTERVAL_SECONDS;
-    }
+    DWORD size = sizeof(DWORD), type = 0, val = 0;
+    LONG  rc = RegQueryValueExW(hKey, REG_VALUE_INTERVAL, NULL, &type,
+                                reinterpret_cast<LPBYTE>(&val), &size);
 
-    DWORD valueSize = sizeof(DWORD);
-    DWORD valueType = 0;
-    DWORD readValue = 0;
-
-    result = RegQueryValueExW(hKey, REG_VALUE_INTERVAL, NULL, &valueType,
-                              reinterpret_cast<LPBYTE>(&readValue), &valueSize);
-
-    if (result == ERROR_SUCCESS && valueType == REG_DWORD && readValue > 0) {
-        interval = readValue;
+    if (rc == ERROR_SUCCESS && type == REG_DWORD && val > 0) {
+        interval = (val < MAX_INTERVAL_SEC) ? val : MAX_INTERVAL_SEC;
     } else {
-        // Value doesn't exist, wrong type, or zero - create/set default
-        interval = DEFAULT_INTERVAL_SECONDS;
         RegSetValueExW(hKey, REG_VALUE_INTERVAL, 0, REG_DWORD,
                        reinterpret_cast<const BYTE*>(&interval), sizeof(DWORD));
     }
@@ -118,288 +138,352 @@ DWORD ReadOrCreateRegistryInterval() {
 }
 
 // ============================================================================
-// Path and File Operations
+// Paths & file helpers
 // ============================================================================
 
-std::wstring GetBackgroundFolderPath() {
-    wchar_t* localAppDataPath = nullptr;
-    std::wstring resultPath;
-
-    HRESULT hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, NULL, &localAppDataPath);
-    if (SUCCEEDED(hr) && localAppDataPath != nullptr) {
-        resultPath = localAppDataPath;
-        resultPath += L"\\BACKGROUND";
-        CoTaskMemFree(localAppDataPath);
+static std::wstring GetBackgroundFolder() {
+    wchar_t*     raw = nullptr;
+    std::wstring result;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, NULL, &raw)) && raw) {
+        result = raw;
+        result += L"\\BACKGROUND";
+        CoTaskMemFree(raw);
     }
-
-    return resultPath;
+    return result;
 }
 
-bool IsSupportedImageFile(const std::wstring& filename) {
-    size_t dotPos = filename.rfind(L'.');
-    if (dotPos == std::wstring::npos) {
-        return false;
-    }
+static bool FolderExists(const std::wstring& path) {
+    DWORD a = GetFileAttributesW(path.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
 
-    std::wstring extension = filename.substr(dotPos);
+static bool FileExists(const std::wstring& path) {
+    DWORD a = GetFileAttributesW(path.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
 
-    // Convert to lowercase for case-insensitive comparison
-    for (wchar_t& ch : extension) {
-        ch = static_cast<wchar_t>(towlower(ch));
-    }
+static bool IsSupportedImage(const std::wstring& name) {
+    size_t dot = name.rfind(L'.');
+    if (dot == std::wstring::npos) return false;
 
-    for (size_t i = 0; i < NUM_SUPPORTED_EXTENSIONS; i++) {
-        if (extension == SUPPORTED_EXTENSIONS[i]) {
-            return true;
-        }
-    }
+    std::wstring ext = name.substr(dot);
+    for (auto& ch : ext) ch = static_cast<wchar_t>(towlower(ch));
 
+    for (size_t i = 0; i < NUM_EXTENSIONS; ++i)
+        if (ext == SUPPORTED_EXTENSIONS[i]) return true;
     return false;
 }
 
-std::vector<std::wstring> ScanImagesInFolder(const std::wstring& folderPath) {
-    std::vector<std::wstring> images;
+static std::vector<std::wstring> ScanImages(const std::wstring& folder) {
+    std::vector<std::wstring> out;
+    if (folder.empty()) return out;
 
-    if (folderPath.empty()) {
-        return images;
-    }
-
-    std::wstring searchPattern = folderPath + L"\\*";
-    WIN32_FIND_DATAW findData = {};
-    HANDLE hFind = FindFirstFileW(searchPattern.c_str(), &findData);
-
-    if (hFind == INVALID_HANDLE_VALUE) {
-        return images;
-    }
+    WIN32_FIND_DATAW fd{};
+    HANDLE hFind = FindFirstFileW((folder + L"\\*").c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return out;
 
     do {
-        // Skip directories
-        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            continue;
-        }
-
-        std::wstring filename = findData.cFileName;
-        if (IsSupportedImageFile(filename)) {
-            std::wstring fullPath = folderPath + L"\\" + filename;
-            images.push_back(fullPath);
-        }
-    } while (FindNextFileW(hFind, &findData));
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (IsSupportedImage(fd.cFileName))
+            out.push_back(folder + L"\\" + fd.cFileName);
+    } while (FindNextFileW(hFind, &fd));
 
     FindClose(hFind);
-    return images;
+    return out;
 }
 
 // ============================================================================
-// Monitor Operations
+// Monitor count (IDesktopWallpaper is the single source of truth)
 // ============================================================================
 
-UINT GetCurrentMonitorCount() {
-    int count = GetSystemMetrics(SM_CMONITORS);
-    return (count > 0) ? static_cast<UINT>(count) : 1;
+static UINT GetMonitorCount() {
+    ScopedComPtr<IDesktopWallpaper> dw;
+    HRESULT hr = CoCreateInstance(__uuidof(DesktopWallpaper), NULL, CLSCTX_ALL,
+                    __uuidof(IDesktopWallpaper),
+                    reinterpret_cast<void**>(dw.GetAddressOf()));
+    if (SUCCEEDED(hr) && dw) {
+        UINT n = 0;
+        if (SUCCEEDED(dw->GetMonitorDevicePathCount(&n)) && n > 0)
+            return n;
+    }
+    int n = GetSystemMetrics(SM_CMONITORS);
+    return (n > 0) ? static_cast<UINT>(n) : 1;
 }
 
 // ============================================================================
-// Image Queue Manager (Simplified)
-// ============================================================================
-// Simple sequential consumption:
-// - Take from queue until empty
-// - When empty, create new shuffled queue
-// - Continue taking
+// Image Queue Manager (shuffle-all, then consume; re-shuffle when empty)
 // ============================================================================
 
 class ImageQueueManager {
-private:
-    std::deque<std::wstring> m_queue;           // Current shuffled queue
-    std::wstring m_folderPath;
-    std::mt19937 m_rng;
+    std::deque<std::wstring>  m_queue;
+    std::vector<std::wstring> m_cache;
+    bool                      m_cacheValid = false;
+    std::wstring              m_folder;
+    std::mt19937              m_rng{ std::random_device{}() };
 
-    bool FileExists(const std::wstring& path) const {
-        DWORD attribs = GetFileAttributesW(path.c_str());
-        return (attribs != INVALID_FILE_ATTRIBUTES) && 
-               !(attribs & FILE_ATTRIBUTE_DIRECTORY);
-    }
-
-    void RefillQueue() {
-        std::vector<std::wstring> images = ScanImagesInFolder(m_folderPath);
-        m_queue.assign(images.begin(), images.end());
+    void Refill() {
+        if (!m_cacheValid) {
+            m_cache      = ScanImages(m_folder);
+            m_cacheValid = true;
+        }
+        m_queue.assign(m_cache.begin(), m_cache.end());
         std::shuffle(m_queue.begin(), m_queue.end(), m_rng);
     }
 
 public:
-    ImageQueueManager() : m_rng(std::random_device{}()) {}
+    void SetFolder(const std::wstring& f) { m_folder = f; }
 
-    void SetFolderPath(const std::wstring& path) {
-        m_folderPath = path;
+    void InvalidateCache() {
+        m_cacheValid = false;
+        m_queue.clear();
     }
 
-    std::vector<std::wstring> GetImagesForUpdate(UINT monitorCount) {
-        std::vector<std::wstring> result;
+    // Returns up to `need` valid image paths
+    std::vector<std::wstring> Take(UINT need) {
+        std::vector<std::wstring> out;
+        const size_t maxAttempts = static_cast<size_t>(need) * 3 + 10;
+        size_t       attempts    = 0;
 
-        while (result.size() < monitorCount) {
-            // Queue empty? Refill it
+        while (out.size() < need && attempts++ < maxAttempts) {
             if (m_queue.empty()) {
-                RefillQueue();
-                
-                // No images at all - exit
-                if (m_queue.empty()) {
-                    break;
-                }
+                Refill();
+                if (m_queue.empty()) break;     // no images at all
             }
-            
-            // Take next from queue
             std::wstring img = m_queue.front();
             m_queue.pop_front();
-            
-            // Use only if file still exists
-            if (FileExists(img)) {
-                result.push_back(img);
-            }
+            if (FileExists(img))
+                out.push_back(std::move(img));
         }
-
-        return result;
+        return out;
     }
-
-    size_t GetQueueRemainingCount() const { return m_queue.size(); }
 };
 
 // ============================================================================
-// Wallpaper Setting via IDesktopWallpaper
+// Set wallpaper on every monitor (COM already initialised)
 // ============================================================================
 
-bool SetWallpaperForMonitors(const std::vector<std::wstring>& imagePaths) {
-    if (imagePaths.empty()) {
-        return false;
-    }
+static bool ApplyWallpapers(const std::vector<std::wstring>& images) {
+    if (images.empty()) return false;
 
-    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-    bool needUninit = SUCCEEDED(hr);
-    
-    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
-        TransitionErrorState(ErrorState::ComInitFailed, L"COM initialization failed");
-        return false;
-    }
+    ScopedComPtr<IDesktopWallpaper> dw;
+    HRESULT hr = CoCreateInstance(__uuidof(DesktopWallpaper), NULL, CLSCTX_ALL,
+                    __uuidof(IDesktopWallpaper),
+                    reinterpret_cast<void**>(dw.GetAddressOf()));
+    if (FAILED(hr) || !dw) return false;
 
-    bool success = false;
-    IDesktopWallpaper* pDesktopWallpaper = nullptr;
+    UINT count = 0;
+    hr = dw->GetMonitorDevicePathCount(&count);
+    if (FAILED(hr) || count == 0) return false;
 
-    // CLSID for DesktopWallpaper: {C2CF3110-460E-4fc1-B9D0-8A1C0C9CC4BD}
-    hr = CoCreateInstance(__uuidof(DesktopWallpaper), NULL, CLSCTX_ALL,
-                          IID_PPV_ARGS(&pDesktopWallpaper));
-
-    if (SUCCEEDED(hr) && pDesktopWallpaper != nullptr) {
-        UINT monitorCount = 0;
-        hr = pDesktopWallpaper->GetMonitorDevicePathCount(&monitorCount);
-
-        if (SUCCEEDED(hr) && monitorCount > 0) {
-            success = true;
-
-            for (UINT i = 0; i < monitorCount; i++) {
-                LPWSTR monitorId = nullptr;
-                hr = pDesktopWallpaper->GetMonitorDevicePathAt(i, &monitorId);
-
-                if (SUCCEEDED(hr) && monitorId != nullptr) {
-                    // Select image for this monitor
-                    size_t imageIndex = (i < imagePaths.size()) ? i : (imagePaths.size() - 1);
-
-                    hr = pDesktopWallpaper->SetWallpaper(monitorId, imagePaths[imageIndex].c_str());
-                    if (FAILED(hr)) {
-                        success = false;
-                    }
-
-                    CoTaskMemFree(monitorId);
-                }
-            }
+    bool ok = true;
+    for (UINT i = 0; i < count; ++i) {
+        LPWSTR monId = nullptr;
+        hr = dw->GetMonitorDevicePathAt(i, &monId);
+        if (SUCCEEDED(hr) && monId) {
+            size_t idx = (i < images.size()) ? i : images.size() - 1;
+            if (FAILED(dw->SetWallpaper(monId, images[idx].c_str())))
+                ok = false;
+            CoTaskMemFree(monId);
         }
-
-        pDesktopWallpaper->Release();
     }
-
-    if (needUninit) {
-        CoUninitialize();
-    }
-
-    return success;
+    return ok;
 }
 
 // ============================================================================
-// Application Entry Point
+// Hidden message-only window  (receives WM_ENDSESSION, WM_CLOSE, …)
 // ============================================================================
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, 
-                    LPWSTR lpCmdLine, int nCmdShow) {
-    // Suppress unused parameter warnings
-    (void)hInstance;
-    (void)hPrevInstance;
-    (void)lpCmdLine;
-    (void)nCmdShow;
+static LRESULT CALLBACK HiddenWndProc(HWND hw, UINT msg,
+                                       WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_QUERYENDSESSION:
+        return TRUE;                          // allow shutdown
+    case WM_ENDSESSION:
+        if (wp && g_hStopEvent) SetEvent(g_hStopEvent);
+        return 0;
+    case WM_CLOSE:
+    case WM_DESTROY:
+        if (g_hStopEvent) SetEvent(g_hStopEvent);
+        PostQuitMessage(0);
+        return 0;
+    default:
+        return DefWindowProcW(hw, msg, wp, lp);
+    }
+}
 
-    // ========================================================================
-    // Single Instance Protection
-    // ========================================================================
+static HWND CreateHiddenWindow(HINSTANCE hInst) {
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = HiddenWndProc;
+    wc.hInstance      = hInst;
+    wc.lpszClassName  = WND_CLASS_NAME;
+    if (!RegisterClassExW(&wc)) return NULL;
+    return CreateWindowExW(0, WND_CLASS_NAME, L"", 0,
+                           0, 0, 0, 0, HWND_MESSAGE, NULL, hInst, NULL);
+}
+
+// ============================================================================
+// File-system watcher helper
+// ============================================================================
+
+static HANDLE CreateFolderWatch(const std::wstring& folder) {
+    if (!FolderExists(folder)) return NULL;
+    HANDLE h = FindFirstChangeNotificationW(
+        folder.c_str(), FALSE,
+        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE |
+        FILE_NOTIFY_CHANGE_SIZE);
+    return (h == INVALID_HANDLE_VALUE) ? NULL : h;
+}
+
+// ============================================================================
+// Entry point
+// ============================================================================
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*prev*/,
+                    LPWSTR /*cmdLine*/, int /*show*/) {
+
+    // ── single instance ─────────────────────────────────────────────────
     HANDLE hMutex = CreateMutexW(NULL, TRUE, MUTEX_NAME);
-    if (hMutex == NULL) {
+    if (!hMutex || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (hMutex) CloseHandle(hMutex);
         return 1;
     }
 
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    // ── COM once ────────────────────────────────────────────────────────
+    HRESULT hrCom   = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    bool    comInit = SUCCEEDED(hrCom);
+    if (FAILED(hrCom) && hrCom != RPC_E_CHANGED_MODE) {
+        LogEventError(L"COM initialization failed");
         CloseHandle(hMutex);
-        return 1; // Another instance is already running
+        return 1;
     }
 
-    // ========================================================================
-    // Initialize
-    // ========================================================================
-    std::wstring backgroundFolder = GetBackgroundFolderPath();
-    if (backgroundFolder.empty()) {
+    // ── stop event ──────────────────────────────────────────────────────
+    g_hStopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!g_hStopEvent) {
+        if (comInit) CoUninitialize();
+        CloseHandle(hMutex);
+        return 1;
+    }
+
+    // ── hidden window (system messages) ─────────────────────────────────
+    HWND hWnd = CreateHiddenWindow(hInstance);
+
+    // ── background folder ───────────────────────────────────────────────
+    std::wstring bgFolder = GetBackgroundFolder();
+    if (bgFolder.empty()) {
         LogEventError(L"Failed to determine LocalAppData path");
+        if (hWnd) DestroyWindow(hWnd);
+        CloseHandle(g_hStopEvent);
+        if (comInit) CoUninitialize();
         CloseHandle(hMutex);
         return 1;
     }
 
-    ImageQueueManager imageQueue;
-    imageQueue.SetFolderPath(backgroundFolder);
+    // ── image queue & folder watcher ────────────────────────────────────
+    ImageQueueManager queue;
+    queue.SetFolder(bgFolder);
 
-    // ========================================================================
-    // Main Loop
-    // ========================================================================
-    while (true) {
-        // Read interval from registry (allows runtime changes)
-        DWORD intervalSeconds = ReadOrCreateRegistryInterval();
+    HANDLE hWatch = CreateFolderWatch(bgFolder);
 
-        // Get current monitor count (handles monitor connect/disconnect)
-        UINT monitorCount = GetCurrentMonitorCount();
+    // ════════════════════════════════════════════════════════════════════
+    // Main loop
+    // ════════════════════════════════════════════════════════════════════
+    bool running = true;
 
-        // Check if background folder exists
-        DWORD folderAttribs = GetFileAttributesW(backgroundFolder.c_str());
-        
-        if (folderAttribs == INVALID_FILE_ATTRIBUTES ||
-            !(folderAttribs & FILE_ATTRIBUTE_DIRECTORY)) {
-            TransitionErrorState(ErrorState::FolderNotFound,
+    while (running) {
+
+        // ── read interval (may be changed at runtime via registry) ──────
+        DWORD intervalSec = ReadOrCreateInterval();
+        DWORD intervalMs  = intervalSec * 1000;   // safe: max 86 400 000
+
+        // ── change wallpaper ────────────────────────────────────────────
+        if (!FolderExists(bgFolder)) {
+            TransitionError(ErrorState::FolderNotFound,
                 L"Background folder not found: AppData\\Local\\BACKGROUND");
+            if (hWatch) { FindCloseChangeNotification(hWatch); hWatch = NULL; }
         } else {
-            // Get images for this update
-            std::vector<std::wstring> selectedImages = imageQueue.GetImagesForUpdate(monitorCount);
+            // re-create watcher if it was lost
+            if (!hWatch) {
+                hWatch = CreateFolderWatch(bgFolder);
+                queue.InvalidateCache();
+            }
 
-            if (selectedImages.empty()) {
-                TransitionErrorState(ErrorState::NoImagesFound,
-                    L"No supported images found in AppData\\Local\\BACKGROUND");
+            UINT monCount = GetMonitorCount();
+            auto images   = queue.Take(monCount);
+
+            if (images.empty()) {
+                TransitionError(ErrorState::NoImagesFound,
+                    L"No supported images in AppData\\Local\\BACKGROUND");
+            } else if (ApplyWallpapers(images)) {
+                TransitionError(ErrorState::None, nullptr);
             } else {
-                // Set wallpapers for all monitors
-                if (SetWallpaperForMonitors(selectedImages)) {
-                    TransitionErrorState(ErrorState::None, nullptr);
-                } else {
-                    TransitionErrorState(ErrorState::SetWallpaperFailed,
-                        L"Failed to set wallpaper using IDesktopWallpaper interface");
-                }
+                TransitionError(ErrorState::SetWallpaperFailed,
+                    L"Failed to set wallpaper via IDesktopWallpaper");
             }
         }
 
-        // Sleep for configured interval
-        Sleep(intervalSeconds * 1000);
+        // ── wait: timeout / stop / folder change / messages ─────────────
+        ULONGLONG startTick = GetTickCount64();
+        DWORD     remaining = intervalMs;
+
+        while (running && remaining > 0) {
+
+            HANDLE  handles[2];
+            DWORD   nHandles = 0;
+            handles[nHandles++] = g_hStopEvent;
+            if (hWatch) handles[nHandles++] = hWatch;
+
+            DWORD wr = MsgWaitForMultipleObjects(
+                           nHandles, handles, FALSE, remaining, QS_ALLINPUT);
+
+            if (wr == WAIT_OBJECT_0) {
+                // stop event
+                running = false;
+                break;
+            }
+
+            if (hWatch && wr == WAIT_OBJECT_0 + 1) {
+                // folder contents changed → invalidate cache
+                queue.InvalidateCache();
+                if (!FindNextChangeNotification(hWatch)) {
+                    // watcher broken — recreate next iteration
+                    FindCloseChangeNotification(hWatch);
+                    hWatch = NULL;
+                }
+                // don't break — finish waiting for the interval
+            }
+
+            if (wr == WAIT_OBJECT_0 + nHandles) {
+                // window messages
+                MSG msg;
+                while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+                    if (msg.message == WM_QUIT) { running = false; break; }
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                if (!running) break;
+            }
+
+            if (wr == WAIT_TIMEOUT) break;      // time to change wallpaper
+
+            if (wr == WAIT_FAILED) break;        // unexpected
+
+            // recalculate remaining time
+            ULONGLONG elapsed = GetTickCount64() - startTick;
+            remaining = (elapsed >= intervalMs)
+                            ? 0
+                            : static_cast<DWORD>(intervalMs - elapsed);
+        }
     }
 
-    // Cleanup (never reached in normal operation)
+    // ── cleanup ─────────────────────────────────────────────────────────
+    if (hWatch) FindCloseChangeNotification(hWatch);
+    if (hWnd)   DestroyWindow(hWnd);
+    UnregisterClassW(WND_CLASS_NAME, hInstance);
+    CloseHandle(g_hStopEvent);
+    if (comInit) CoUninitialize();
     CloseHandle(hMutex);
-    return 0;
 
+    return 0;
 }
