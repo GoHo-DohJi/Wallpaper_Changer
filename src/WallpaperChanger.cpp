@@ -53,7 +53,7 @@ public:
 // Constants
 // ============================================================================
 
-static const wchar_t* MUTEX_NAME            = L"Global\\WallpaperChangerSingleInstanceMutex_v1";
+static const wchar_t* MUTEX_NAME            = L"Global\\WallpaperChangerSingleInstanceMutex";
 static const wchar_t* REG_KEY_PATH          = L"Software\\WallpaperChanger";
 static const wchar_t* REG_VALUE_INTERVAL    = L"IntervalSeconds";
 static const DWORD    DEFAULT_INTERVAL_SEC  = 300;        // 5 minutes
@@ -487,3 +487,4 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*prev*/,
 
     return 0;
 }
+
