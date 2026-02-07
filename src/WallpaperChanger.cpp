@@ -36,9 +36,9 @@ static const wchar_t* EVENT_LOG_SOURCE = L"WallpaperChanger";
 
 // Supported wallpaper file extensions (Windows supported formats)
 static const wchar_t* SUPPORTED_EXTENSIONS[] = {
-    L".jpg", L".jpeg", L".jpe", L".jfif",
-    L".png", L".bmp", L".dib",
-    L".gif", L".tif", L".tiff", L".wdp"
+    L".jpg", L".jpeg", L".jpe", L".jfif", L".avif",
+    L".png", L".bmp", L".dib", L".heic", L".heif",
+    L".gif", L".tif", L".tiff", L".wdp", L".webp"
 };
 static const size_t NUM_SUPPORTED_EXTENSIONS = sizeof(SUPPORTED_EXTENSIONS) / sizeof(SUPPORTED_EXTENSIONS[0]);
 
@@ -406,3 +406,4 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     return 0;
 
 }
+
