@@ -4,20 +4,20 @@
 
 cd {PATH_TO_PROJECT}\SLIDESHOW
 
-rc src\app.rc
+rc resources\app.rc
 
-cl /nologo ^
-   /std:c++17 ^
+cl /std:c++17 ^
    /O2 /GL ^
    /DNDEBUG ^
    /MT ^
    /W4 ^
    /EHsc ^
-   src\WallpaperChanger.cpp src\app.res ^
+   src\main.cpp resources\app.res ^
    /link ^
    /LTCG ^
    /INCREMENTAL:NO ^
-   /OPT:REF /OPT:ICF
+   /OPT:REF /OPT:ICF ^
+   /OUT:build\WallpaperChanger.exe
 
 
 
@@ -66,5 +66,6 @@ Copy-Item `
 # Cleanup
 Remove-Item $tempZip -Force
 Remove-Item $tempDir -Recurse -Force
+
 
 
